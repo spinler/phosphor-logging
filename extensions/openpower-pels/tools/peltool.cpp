@@ -23,8 +23,10 @@
 #include "../pel.hpp"
 #include "../pel_types.hpp"
 #include "../pel_values.hpp"
+#include "xyz/openbmc_project/Logging/Create/server.hpp"
 
 #include <Python.h>
+#include <fcntl.h>
 
 #include <CLI/CLI.hpp>
 #include <phosphor-logging/log.hpp>
@@ -46,6 +48,12 @@ const uint8_t critSysTermSeverity = 0x51;
 using PELFunc = std::function<void(const PEL&, bool hexDump)>;
 message::Registry registry(getPELReadOnlyDataPath() / message::registryFileName,
                            false);
+
+using CreateIface = sdbusplus::xyz::openbmc_project::Logging::server::Create;
+using FFDCEntry = std::tuple<CreateIface::FFDCFormat, uint8_t, uint8_t,
+                             sdbusplus::message::unix_fd>;
+using FFDCEntries = std::vector<FFDCEntry>;
+
 namespace service
 {
 constexpr auto logging = "xyz.openbmc_project.Logging";
@@ -832,6 +840,64 @@ std::regex genRegex(std::string& scrubFile)
     }
 }
 
+FFDCEntry getCustomFFDC(size_t udSize)
+{
+    if (udSize == 0)
+    {
+        std::cerr << "Won't create a PEL with UD size 0\n";
+        exit(1);
+    }
+
+    const std::string path{"/tmp/customffdc"};
+    std::vector<uint8_t> data(udSize, 0xFF);
+
+    std::ofstream stream{path};
+    stream.write(reinterpret_cast<const char*>(data.data()), data.size());
+    stream.close();
+
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd == -1)
+    {
+        auto e = errno;
+        std::cerr << "Could not open temp ffdc file, errno = " << e << '\n';
+        exit(1);
+    }
+
+    FFDCEntry ffdc{CreateIface::FFDCFormat::Custom, 5, 5, fd};
+
+    return ffdc;
+}
+FFDCEntries getFFDC(size_t udSize)
+{
+    FFDCEntries ffdc;
+
+    ffdc.push_back(getCustomFFDC(udSize));
+
+    return ffdc;
+}
+static void createPEL(size_t udSize)
+{
+    FFDCEntries ffdc = getFFDC(udSize);
+
+    std::map<std::string, std::string> ad;
+    ad["_PID"] = std::to_string(getpid());
+
+    auto bus = sdbusplus::bus::new_default();
+    auto method = bus.new_method_call(
+        "xyz.openbmc_project.Logging", "/xyz/openbmc_project/logging",
+        "xyz.openbmc_project.Logging.Create", "CreateWithFFDCFiles");
+    auto level =
+        sdbusplus::xyz::openbmc_project::Logging::server::convertForMessage(
+            sdbusplus::xyz::openbmc_project::Logging::server::Entry::Level::
+                Error);
+
+    method.append("org.open_power.Logging.Error.TestError1", level, ad, ffdc);
+
+    auto reply = bus.call(method);
+
+    std::filesystem::remove("/tmp/customffdc");
+}
+
 static void exitWithError(const std::string& help, const char* err)
 {
     std::cerr << "ERROR: " << err << std::endl << help << std::endl;
@@ -857,12 +923,14 @@ int main(int argc, char** argv)
     bool fullPEL = false;
     bool hexDump = false;
     bool archive = false;
+    std::string udSize;
 
     app.set_help_flag("--help", "Print this help message and exit");
     app.add_option("--file", fileName, "Display a PEL using its Raw PEL file");
     app.add_option("-i, --id", idPEL, "Display a PEL based on its ID");
     app.add_option("--bmc-id", bmcId,
                    "Display a PEL based on its BMC Event ID");
+    app.add_option("-c, --create", udSize, "Create PEL with specified userdata size");
     app.add_flag("-a", fullPEL, "Display all PELs");
     app.add_flag("-l", listPEL, "List PELs");
     app.add_flag("-n", showPELCount, "Show number of PELs");
@@ -936,6 +1004,11 @@ int main(int argc, char** argv)
     else if (deleteAll)
     {
         deleteAllPELs();
+    }
+    else if (!udSize.empty())
+    {
+        size_t size = std::stoul(udSize, nullptr, 0);
+        createPEL(size);
     }
     else
     {
